@@ -331,7 +331,7 @@ func paste(_ text: String) {
 
 enum Mode { case dictation, toolCall }
 
-let appVersion = "1.2.0"
+let appVersion = "1.2.1"
 let gitHubRepo = "JPE-Studio/MacVoice" // GitHub repo for the update check
 
 enum DictKey: String { case rightCmd, rightOpt, f5 }
