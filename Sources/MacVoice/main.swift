@@ -8,7 +8,7 @@ import Ccactus
 
 let toolsJSON = """
 [{"name":"set_volume","description":"Set the Mac's output volume","parameters":{"type":"object","properties":{"percent":{"type":"integer","description":"0-100"}},"required":["percent"]}},
-{"name":"open_app","description":"Open an installed application like Safari, Mail or Spotify (only real app names, not websites)","parameters":{"type":"object","properties":{"app":{"type":"string"}},"required":["app"]}},
+{"name":"open_app","description":"Open an installed application. macOS app names are ALWAYS in English, e.g. Terminal, Notes, Safari, Mail, Preview, Calendar, Messages, Music, Maps, Photos, Reminders, Calculator, Figma. Never use German app names like Terminalfenster or Notizen.","parameters":{"type":"object","properties":{"app":{"type":"string"}},"required":["app"]}},
 {"name":"quit_app","description":"Quit an application","parameters":{"type":"object","properties":{"app":{"type":"string"}},"required":["app"]}},
 {"name":"open_url","description":"Open a web address in the browser. Use this for any website or domain like wikipedia.org, never open_app","parameters":{"type":"object","properties":{"url":{"type":"string"}},"required":["url"]}},
 {"name":"lock_screen","description":"Lock the screen","parameters":{"type":"object","properties":{}}},
@@ -197,14 +197,15 @@ final class WaveView: NSView {
             .font: NSFont.systemFont(ofSize: 13, weight: .semibold),
             .foregroundColor: NSColor.white,
         ])
-        // waveform: last 26 levels
+        // waveform: last 26 levels (only while recording — hidden on result display)
         let bars = 26
-        for i in 0..<bars {
+        if !history.isEmpty { for i in 0..<bars {
             let idx = history.count - bars + i
             let level: Float = idx >= 0 && idx < history.count ? history[idx] : 0
             let h = max(3, min(34, CGFloat(level) * 90))
             NSColor.systemGreen.setFill()
             NSBezierPath(roundedRect: NSRect(x: 320 + CGFloat(i) * 6, y: bounds.midY - h / 2, width: 3.5, height: h), xRadius: 1.5, yRadius: 1.5).fill()
+            }
         }
     }
 }
@@ -246,8 +247,21 @@ func runCmd(_ args: [String]) -> String {
     p.standardError = p.standardOutput
     do { try p.run(); p.waitUntilExit() } catch { return "error: \(error)" }
     let data = (p.standardOutput as? Pipe)?.fileHandleForReading.readDataToEndOfFile() ?? Data()
-    return String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? "ok"
+    let out = String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+    return out.isEmpty ? "ok" : out
 }
+
+/// German macOS app names → real (English) app names
+let appNameAliases: [String: String] = [
+    "terminalfenster": "Terminal", "terminal": "Terminal",
+    "notizen": "Notes", "vorschau": "Preview", "kalender": "Calendar",
+    "nachrichten": "Messages", "erinnerungen": "Reminders", "karten": "Maps",
+    "fotos": "Photos", "musik": "Music", "rechner": "Calculator",
+    "textbearbeitung": "TextEdit", "safari": "Safari", "mail": "Mail",
+    "figma": "Figma", "notes": "Notes", "preview": "Preview",
+    "calendar": "Calendar", "messages": "Messages", "reminders": "Reminders",
+    "maps": "Maps", "photos": "Photos", "music": "Music", "calculator": "Calculator",
+]
 
 func executeTool(_ name: String, _ args: [String: Any]) -> String {
     switch name {
@@ -255,7 +269,13 @@ func executeTool(_ name: String, _ args: [String: Any]) -> String {
         let pct = max(0, min(100, (args["percent"] as? Int) ?? 50))
         return runCmd(["/usr/bin/osascript", "-e", "set volume output volume \(pct)"])
     case "open_app":
-        return runCmd(["/usr/bin/open", "-a", (args["app"] as? String) ?? ""])
+        let app = (args["app"] as? String) ?? ""
+        let resolved = appNameAliases[app.lowercased().trimmingCharacters(in: .whitespaces)] ?? app
+        let r = runCmd(["/usr/bin/open", "-a", resolved])
+        // background launches don't get focus — activate explicitly
+        _ = runCmd(["/usr/bin/osascript", "-e", "tell application \"\(resolved)\" to activate"])
+        if resolved != app { log("app alias: \"\(app)\" -> \(resolved)") }
+        return r
     case "quit_app":
         return runCmd(["/usr/bin/osascript", "-e", "tell application \"\((args["app"] as? String) ?? "")\" to quit"])
     case "open_url":
@@ -405,6 +425,9 @@ final class Controller: NSObject, NSApplicationDelegate {
         let updateItem = NSMenuItem(title: "Check for updates", action: #selector(checkForUpdatesMenu), keyEquivalent: "")
         updateItem.target = self
         menu.addItem(updateItem)
+        let testItem = NSMenuItem(title: "Test tool call (open Figma)", action: #selector(testToolCall), keyEquivalent: "")
+        testItem.target = self
+        menu.addItem(testItem)
         let aboutItem = NSMenuItem(title: "About MacVoice", action: #selector(showAbout), keyEquivalent: "")
         aboutItem.target = self
         menu.addItem(aboutItem)
@@ -499,16 +522,20 @@ final class Controller: NSObject, NSApplicationDelegate {
                 self.finish("✓ \"\(text)\"")
             }
         case .toolCall:
-            Engine.shared.complete(input: "", pcm: pcm) { [weak self] r in
+            // input must be nil for the audio path — "" makes cactus_complete fail
+            Engine.shared.complete(input: nil, pcm: pcm) { [weak self] r in
                 self?.handleCalls(r)
             }
         }
     }
 
     private func handleCalls(_ result: [String: Any]?) {
+        log("complete result: \(result ?? [:])")
         guard let calls = result?["function_calls"] as? [[String: Any]], !calls.isEmpty else {
             let heard = (result?["audio_text"] as? String) ?? ""
-            finish(heard.isEmpty ? "no tool recognized" : "no tool for \"\(heard)\"")
+            let msg = heard.isEmpty ? "no tool recognized" : "no tool for \"\(heard)\""
+            finish(msg)
+            showResult(msg)
             return
         }
         DispatchQueue.global(qos: .userInitiated).async {
@@ -517,10 +544,13 @@ final class Controller: NSObject, NSApplicationDelegate {
                 let name = call["name"] as? String ?? "?"
                 let args = call["arguments"] as? [String: Any] ?? [:]
                 let out = executeTool(name, args)
+                log("tool \(name) \(args) -> \(out)")
                 summary.append("\(name): \(out)")
             }
             DispatchQueue.main.async {
-                self.finish(summary.joined(separator: " | "))
+                let msg = summary.joined(separator: " | ")
+                self.finish(msg)
+                self.showResult("✓ " + msg)
             }
         }
     }
@@ -531,6 +561,27 @@ final class Controller: NSObject, NSApplicationDelegate {
         DispatchQueue.main.asyncAfter(deadline: .now() + 3) { [weak self] in
             self?.setIcon("🎙")
         }
+    }
+
+    /// show a result on the floating panel for a moment (visible tool-call feedback)
+    private func showResult(_ text: String) {
+        panel = panel ?? MicPanel()
+        panel?.show(label: String(text.prefix(34)))
+        panel?.waveView.history = []
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2.5) { [weak self] in
+            self?.panel?.orderOut(nil)
+        }
+    }
+
+    /// ⌘⇧ joined mid-recording → change dictation into a tool call on the fly
+    private func switchMode(_ mode: Mode) {
+        guard recording, self.mode != mode else { return }
+        self.mode = mode
+        recordingSource = mode
+        panel?.waveView.label = mode == .dictation ? "Dictation — release to send" : "Tool call"
+        panel?.waveView.history = []
+        panel?.waveView.needsDisplay = true
+        log("switched mode -> \(mode == .dictation ? "dictation" : "toolCall")")
     }
 
     /// discard the current recording without sending (e.g. another key joined a ⌘⇧ shortcut)
@@ -587,6 +638,19 @@ final class Controller: NSObject, NSApplicationDelegate {
         Engine.shared.setLanguage(forcedLanguage)
         statusLine.title = "language: \(sender.title)"
         log("language -> \(sender.representedObject ?? "?")")
+    }
+
+    /// runs the tool execution layer directly (no voice) — debugging aid
+    @objc private func testToolCall() {
+        statusLine.title = "running test: open_app …"
+        DispatchQueue.global(qos: .userInitiated).async {
+            let out = executeTool("open_app", ["app": "Figma"])
+            DispatchQueue.main.async {
+                log("TEST open_app -> \(out)")
+                self.finish("test: \(out)")
+                self.showResult("✓ \(out)")
+            }
+        }
     }
 
     @objc private func showAbout() {
@@ -744,8 +808,13 @@ final class Controller: NSObject, NSApplicationDelegate {
             }
             if toolKey == .cmdShift { // ⌘+⇧ held = tool call
                 let both = event.flags.contains(.maskCommand) && event.flags.contains(.maskShift)
-                if both && !cmdShiftDown, recordingSource == nil {
-                    DispatchQueue.main.async { self.startRecording(.toolCall) }
+                if both && !cmdShiftDown {
+                    if recordingSource == nil {
+                        DispatchQueue.main.async { self.startRecording(.toolCall) }
+                    } else if recordingSource == .dictation {
+                        // ⇧ joined a running ⌘-dictation (or ⌘ joined ⇧) → live switch to tool call
+                        DispatchQueue.main.async { self.switchMode(.toolCall) }
+                    }
                 }
                 if !both && cmdShiftDown, recordingSource == .toolCall {
                     DispatchQueue.main.async { self.stopRecording() }
