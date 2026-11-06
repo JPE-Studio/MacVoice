@@ -25,6 +25,9 @@ cp dist/MacVoice.zip dist/MacVoice-v$NEW.zip
 git add -A
 git commit -m "release v$NEW" >/dev/null || true
 git tag "v$NEW"
+git push -q origin main "v$NEW"
 
-gh release create "v$NEW" dist/MacVoice.zip --title "MacVoice v$NEW" --generate-notes
+# release notes = the changelog section for this version
+awk -v ver="$NEW" 'BEGIN{p=0} /^## /{p = ($0 ~ "## v"ver)} p' CHANGELOG.md > /tmp/mv_changelog.txt
+gh release create "v$NEW" dist/MacVoice.zip dist/INSTALL.txt --title "MacVoice v$NEW" --notes-file /tmp/mv_changelog.txt
 echo "released v$NEW — apps running v$CUR will now see the update"
