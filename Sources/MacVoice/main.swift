@@ -599,7 +599,7 @@ final class Controller: NSObject, NSApplicationDelegate {
         Dictation: hold \(dictKey.label)
         Tool call: hold \(toolKey.label)
 
-        github.com/JPE-Studio/MacVoice
+        © Julian Petermaier — github.com/JPE-Studio/MacVoice
         """
         alert.addButton(withTitle: "Open GitHub")
         alert.addButton(withTitle: "Close")
