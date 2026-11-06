@@ -19,7 +19,7 @@ cat > "$APP/Contents/Info.plist" <<'EOF'
 <plist version="1.0">
 <dict>
     <key>CFBundleName</key><string>MacVoice</string>
-    <key>CFBundleShortVersionString</key><string>1.1.0</string>
+    <key>CFBundleShortVersionString</key><string>1.2.0</string>
     <key>CFBundleIdentifier</key><string>at.petermaier.macvoice</string>
     <key>CFBundleExecutable</key><string>MacVoice</string>
     <key>CFBundleIconFile</key><string>AppIcon</string>

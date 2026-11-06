@@ -17,7 +17,11 @@ let toolsJSON = """
 {"name":"say_text","description":"Speak text aloud with the Mac voice. Use when asked to say, speak or announce something (e.g. 'say hello' or 'sag hallo')","parameters":{"type":"object","properties":{"text":{"type":"string"}},"required":["text"]}}]
 """
 
-let forcedLanguage: String? = "de" // nil = auto-detect
+/// speech language for recognition; nil = auto-detect (default)
+var forcedLanguage: String? {
+    let raw = UserDefaults.standard.string(forKey: "language") ?? "auto"
+    return raw == "auto" ? nil : raw
+}
 
 final class Engine {
     static let shared = Engine()
@@ -42,8 +46,16 @@ final class Engine {
                 if ok != 0 { fatalError("MacVoice: cactus_load failed for \(name): \(String(cString: cactus_last_error()))") }
             }
             cactus_init(nil, toolsJSON, nil)
-            forcedLanguage?.withCString { cactus_set_audio($0, nil, 0) }
+            forcedLanguage?.withCString { cactus_set_audio($0, nil, 0) } ?? cactus_set_audio(nil, nil, 0)
             loaded = true
+        }
+    }
+
+    /// apply a language change to the audio tool-call path at runtime
+    func setLanguage(_ lang: String?) {
+        queue.async {
+            lang?.withCString { cactus_set_audio($0, nil, 0) } ?? cactus_set_audio(nil, nil, 0)
+            log("engine language -> \(lang ?? "auto")")
         }
     }
 
@@ -299,16 +311,16 @@ func paste(_ text: String) {
 
 enum Mode { case dictation, toolCall }
 
-let appVersion = "1.1.0"
+let appVersion = "1.2.0"
 let gitHubRepo = "JPE-Studio/MacVoice" // GitHub repo for the update check
 
 enum DictKey: String { case rightCmd, rightOpt, f5 }
 enum ToolKey: String { case cmdShift, f6, rightOpt }
 extension DictKey {
-    var label: String { switch self { case .rightCmd: return "rechte ⌘"; case .rightOpt: return "rechte ⌥"; case .f5: return "F5" } }
+    var label: String { switch self { case .rightCmd: return "right ⌘"; case .rightOpt: return "right ⌥"; case .f5: return "F5" } }
 }
 extension ToolKey {
-    var label: String { switch self { case .cmdShift: return "⌘+⇧"; case .f6: return "F6"; case .rightOpt: return "rechte ⌥" } }
+    var label: String { switch self { case .cmdShift: return "⌘+⇧"; case .f6: return "F6"; case .rightOpt: return "right ⌥" } }
 }
 
 func isNewer(_ a: String, than b: String) -> Bool {
@@ -348,8 +360,9 @@ final class Controller: NSObject, NSApplicationDelegate {
     private var toolKey: ToolKey = .cmdShift
     private var dictSub = NSMenu()
     private var toolSub = NSMenu()
+    private var langSub = NSMenu()
     private var retryTimer: Timer?
-    private var statusLine = NSMenuItem(title: "lädt Modelle …", action: nil, keyEquivalent: "")
+    private var statusLine = NSMenuItem(title: "loading models …", action: nil, keyEquivalent: "")
     private var dictItem = NSMenuItem(title: "Diktat (⌘ rechts halten)", action: nil, keyEquivalent: "")
     private var toolItem = NSMenuItem(title: "Tool-Call (F6 halten)", action: nil, keyEquivalent: "")
 
@@ -364,8 +377,15 @@ final class Controller: NSObject, NSApplicationDelegate {
         menu.addItem(dictItem)
         menu.addItem(toolItem)
         menu.addItem(.separator())
-        let dictSettings = NSMenuItem(title: "Diktat-Taste …", action: nil, keyEquivalent: "")
-        let toolSettings = NSMenuItem(title: "Tool-Taste …", action: nil, keyEquivalent: "")
+        let dictSettings = NSMenuItem(title: "Dictation key …", action: nil, keyEquivalent: "")
+        let toolSettings = NSMenuItem(title: "Tool key …", action: nil, keyEquivalent: "")
+        let langSettings = NSMenuItem(title: "Language …", action: nil, keyEquivalent: "")
+        for (label, code) in [("Automatic", "auto"), ("English", "en"), ("German", "de"), ("French", "fr"), ("Spanish", "es"), ("Italian", "it"), ("Dutch", "nl"), ("Polish", "pl")] {
+            let i = NSMenuItem(title: label, action: #selector(setLanguage(_:)), keyEquivalent: "")
+            i.target = self; i.representedObject = code
+            langSub.addItem(i)
+        }
+        langSettings.submenu = langSub
         for (label, key) in [("Rechte ⌘", DictKey.rightCmd), ("Rechte ⌥", DictKey.rightOpt), ("F5", DictKey.f5)] {
             let i = NSMenuItem(title: label, action: #selector(setDictKey(_:)), keyEquivalent: "")
             i.target = self; i.representedObject = key.rawValue
@@ -380,11 +400,16 @@ final class Controller: NSObject, NSApplicationDelegate {
         toolSettings.submenu = toolSub
         menu.addItem(dictSettings)
         menu.addItem(toolSettings)
-        let updateItem = NSMenuItem(title: "Nach Updates suchen", action: #selector(checkForUpdatesMenu), keyEquivalent: "")
+        menu.addItem(langSettings)
+        menu.addItem(.separator())
+        let updateItem = NSMenuItem(title: "Check for updates", action: #selector(checkForUpdatesMenu), keyEquivalent: "")
         updateItem.target = self
         menu.addItem(updateItem)
+        let aboutItem = NSMenuItem(title: "About MacVoice", action: #selector(showAbout), keyEquivalent: "")
+        aboutItem.target = self
+        menu.addItem(aboutItem)
         menu.addItem(.separator())
-        menu.addItem(NSMenuItem(title: "Beenden", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q"))
+        menu.addItem(NSMenuItem(title: "Quit", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q"))
         statusItem.menu = menu
         dictItem.target = self; dictItem.action = #selector(toggleDictation)
         toolItem.target = self; toolItem.action = #selector(toggleToolCall)
@@ -406,7 +431,7 @@ final class Controller: NSObject, NSApplicationDelegate {
             DispatchQueue.main.async {
                 self.ready = true
                 self.refreshMenuLabels()
-                self.statusLine.title = "bereit — Diktat: \(self.dictKey.label), Tool: \(self.toolKey.label)"
+                self.statusLine.title = "ready — dictation: \(self.dictKey.label), tool: \(self.toolKey.label)"
                 self.autoCheckForUpdates()
             }
         }
@@ -437,14 +462,14 @@ final class Controller: NSObject, NSApplicationDelegate {
             recording = true
             setRecordingDot()
             panel = panel ?? MicPanel()
-            panel?.show(label: mode == .dictation ? "Diktat — loslassen zum Senden" : "Tool-Call")
+            panel?.show(label: mode == .dictation ? "Dictation — release to send" : "Tool call")
             waveHistory = []
             waveTimer = Timer.scheduledTimer(withTimeInterval: 0.07, repeats: true) { [weak self] _ in
                 self?.drawWave()
             }
         } catch {
             log("recorder start failed: \(error)")
-            statusLine.title = "Mikrofon-Fehler: \(error.localizedDescription)"
+            statusLine.title = "Microphone error: \(error.localizedDescription)"
         }
     }
 
@@ -460,18 +485,18 @@ final class Controller: NSObject, NSApplicationDelegate {
         recordingSource = nil
         log("stopped, samples: \(pcm.count)")
         setIcon("…")
-        statusLine.title = "transkribiere …"
-        guard pcm.count > 1600 else { finish("(zu kurz)"); return }
+        statusLine.title = "transcribing …"
+        guard pcm.count > 1600 else { finish("(too short)"); return }
         switch mode {
         case .dictation:
             Engine.shared.transcribe(pcm) { [weak self] result in
                 guard let self else { return }
                 let text = (result?["text"] as? String) ?? ""
                 log("transcribed: \"\(text)\" raw=\(result ?? [:])")
-                if text.isEmpty { self.finish("(Stille)"); return }
+                if text.isEmpty { self.finish("(silence)"); return }
                 // always paste: works in every app (incl. Electron), no AX guesswork
                 paste(text)
-                self.finish("✓ „\(text)“")
+                self.finish("✓ \"\(text)\"")
             }
         case .toolCall:
             Engine.shared.complete(input: "", pcm: pcm) { [weak self] r in
@@ -483,7 +508,7 @@ final class Controller: NSObject, NSApplicationDelegate {
     private func handleCalls(_ result: [String: Any]?) {
         guard let calls = result?["function_calls"] as? [[String: Any]], !calls.isEmpty else {
             let heard = (result?["audio_text"] as? String) ?? ""
-            finish(heard.isEmpty ? "kein Tool erkannt" : "kein Tool für „\(heard)“")
+            finish(heard.isEmpty ? "no tool recognized" : "no tool for \"\(heard)\"")
             return
         }
         DispatchQueue.global(qos: .userInitiated).async {
@@ -532,17 +557,19 @@ final class Controller: NSObject, NSApplicationDelegate {
     // MARK: settings + updates
 
     private func refreshMenuLabels() {
-        dictItem.title = "Diktat (\(dictKey.label) halten)"
-        toolItem.title = "Tool-Call (\(toolKey.label) halten)"
+        dictItem.title = "Dictation (hold \(dictKey.label))"
+        toolItem.title = "Tool Call (hold \(toolKey.label))"
         for i in dictSub.items { i.state = (i.representedObject as? String) == dictKey.rawValue ? .on : .off }
         for i in toolSub.items { i.state = (i.representedObject as? String) == toolKey.rawValue ? .on : .off }
+        let lang = UserDefaults.standard.string(forKey: "language") ?? "auto"
+        for i in langSub.items { i.state = (i.representedObject as? String) == lang ? .on : .off }
     }
 
     @objc private func setDictKey(_ sender: NSMenuItem) {
         dictKey = DictKey(rawValue: sender.representedObject as? String ?? "") ?? .rightCmd
         UserDefaults.standard.set(dictKey.rawValue, forKey: "dictKey")
         refreshMenuLabels()
-        statusLine.title = "bereit — Diktat: \(dictKey.label), Tool: \(toolKey.label)"
+        statusLine.title = "ready — dictation: \(dictKey.label), tool: \(toolKey.label)"
         log("dictKey -> \(dictKey.rawValue)")
     }
 
@@ -550,11 +577,38 @@ final class Controller: NSObject, NSApplicationDelegate {
         toolKey = ToolKey(rawValue: sender.representedObject as? String ?? "") ?? .cmdShift
         UserDefaults.standard.set(toolKey.rawValue, forKey: "toolKey")
         refreshMenuLabels()
-        statusLine.title = "bereit — Diktat: \(dictKey.label), Tool: \(toolKey.label)"
+        statusLine.title = "ready — dictation: \(dictKey.label), tool: \(toolKey.label)"
         log("toolKey -> \(toolKey.rawValue)")
     }
 
-    @objc private func checkForUpdatesMenu() { checkForUpdates(silent: false) }
+    @objc private func setLanguage(_ sender: NSMenuItem) {
+        UserDefaults.standard.set(sender.representedObject as? String ?? "auto", forKey: "language")
+        refreshMenuLabels()
+        Engine.shared.setLanguage(forcedLanguage)
+        statusLine.title = "language: \(sender.title)"
+        log("language -> \(sender.representedObject ?? "?")")
+    }
+
+    @objc private func showAbout() {
+        let alert = NSAlert()
+        alert.messageText = "MacVoice \(appVersion)"
+        alert.informativeText = """
+        On-device speech to text + tool calling.
+        Whistle STT · Needle 3 · Cactus engine — no cloud, no telemetry.
+
+        Dictation: hold \(dictKey.label)
+        Tool call: hold \(toolKey.label)
+
+        github.com/JPE-Studio/MacVoice
+        """
+        alert.addButton(withTitle: "Open GitHub")
+        alert.addButton(withTitle: "Close")
+        if alert.runModal() == .alertFirstButtonReturn {
+            NSWorkspace.shared.open(URL(string: "https://github.com/JPE-Studio/MacVoice")!)
+        }
+    }
+
+    @objc private func checkForUpdatesMenu() { checkForUpdates(silent: false) } // manual = always show feedback
 
     /// auto-check once per 24 h
     private func autoCheckForUpdates() {
@@ -574,15 +628,26 @@ final class Controller: NSObject, NSApplicationDelegate {
                   let data,
                   let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
                   let tag = json["tag_name"] as? String else {
-                if !silent { DispatchQueue.main.async { self.statusLine.title = "Update-Check fehlgeschlagen (Repo \(gitHubRepo)?)" } }
+                if !silent {
+                    DispatchQueue.main.async {
+                        let a = NSAlert()
+                        a.messageText = "Update check failed"
+                        a.informativeText = "Could not reach github.com/\(gitHubRepo)."
+                        a.runModal()
+                    }
+                }
                 return
             }
             let latest = tag.hasPrefix("v") ? String(tag.dropFirst()) : tag
             DispatchQueue.main.async {
-                if latest != appVersion, isNewer(latest, than: appVersion) {
+                if isNewer(latest, than: appVersion) {
                     self.offerUpdate(tag: tag, json: json)
                 } else if !silent {
-                    self.statusLine.title = "aktuell (v\(appVersion))"
+                    let a = NSAlert()
+                    a.messageText = "You're up to date"
+                    a.informativeText = "MacVoice v\(appVersion) is the latest version."
+                    a.runModal()
+                    self.statusLine.title = "up to date (v\(appVersion))"
                 }
             }
         }.resume()
@@ -592,14 +657,14 @@ final class Controller: NSObject, NSApplicationDelegate {
         let assets = json["assets"] as? [[String: Any]] ?? []
         let zip = assets.first { ($0["name"] as? String) == "MacVoice.zip" }
         let alert = NSAlert()
-        alert.messageText = "Update verfügbar: v\(tag)"
-        alert.informativeText = "Version \(tag) ist auf GitHub verfügbar. Jetzt herunterladen?"
-        alert.addButton(withTitle: "Herunterladen")
-        alert.addButton(withTitle: "Später")
+        alert.messageText = "Update available: v\(tag)"
+        alert.informativeText = "Version \(tag) is available on GitHub. Download now?"
+        alert.addButton(withTitle: "Download")
+        alert.addButton(withTitle: "Later")
         if alert.runModal() == .alertFirstButtonReturn, let urlStr = zip?["browser_download_url"] as? String, let url = URL(string: urlStr) {
             let dest = FileManager.default.homeDirectoryForCurrentUser
                 .appendingPathComponent("Downloads/MacVoice-\(tag).zip")
-            statusLine.title = "lade Update v\(tag) …"
+            statusLine.title = "downloading v\(tag) …"
             URLSession.shared.downloadTask(with: url) { localUrl, _, _ in
                 guard let localUrl else { return }
                 try? FileManager.default.removeItem(at: dest)
@@ -610,7 +675,7 @@ final class Controller: NSObject, NSApplicationDelegate {
                 proc.arguments = ["-x", "-k", dest.path, dest.deletingLastPathComponent().path]
                 try? proc.run(); proc.waitUntilExit()
                 DispatchQueue.main.async {
-                    self.statusLine.title = "✓ Update in Downloads entpackt — App in Programme ersetzen"
+                    self.statusLine.title = "✓ update unzipped to Downloads — replace the app in /Applications"
                     NSWorkspace.shared.selectFile(nil, inFileViewerRootedAtPath: dest.deletingLastPathComponent().path)
                 }
             }.resume()
@@ -638,7 +703,7 @@ final class Controller: NSObject, NSApplicationDelegate {
             log("event tap installed")
         } else {
             log("event tap FAILED — accessibility permission missing")
-            statusLine.title = "⚠️ Bedienungshilfen fehlen: Systemeinstellungen → Datenschutz → Bedienungshilfen"
+            statusLine.title = "⚠️ Accessibility missing: System Settings → Privacy & Security → Accessibility"
             retryTimer = Timer.scheduledTimer(withTimeInterval: 3, repeats: true) { [weak self] _ in
                 guard AXIsProcessTrusted() else { return }
                 self?.installHotkeys()
