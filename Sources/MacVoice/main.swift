@@ -8,13 +8,18 @@ import Ccactus
 
 let toolsJSON = """
 [{"name":"set_volume","description":"Set the Mac's output volume","parameters":{"type":"object","properties":{"percent":{"type":"integer","description":"0-100"}},"required":["percent"]}},
-{"name":"open_app","description":"Open an installed application. macOS app names are ALWAYS in English, e.g. Terminal, Notes, Safari, Mail, Preview, Calendar, Messages, Music, Maps, Photos, Reminders, Calculator, Figma. Never use German app names like Terminalfenster or Notizen.","parameters":{"type":"object","properties":{"app":{"type":"string"}},"required":["app"]}},
+{"name":"open_app","description":"Open an installed application. macOS app names are ALWAYS in English, e.g. Terminal, Notes, Safari, Mail, Preview, Calendar, Messages, Music, Maps, Photos, Reminders, Calculator, Figma. Never use German app names like Terminalfenster or Notizen. If the user asks for a WEBSITE (google.com, wikipedia.org), call open_url instead.","parameters":{"type":"object","properties":{"app":{"type":"string"}},"required":["app"]}},
 {"name":"quit_app","description":"Quit an application","parameters":{"type":"object","properties":{"app":{"type":"string"}},"required":["app"]}},
-{"name":"open_url","description":"Open a web address in the browser. Use this for any website or domain like wikipedia.org, never open_app","parameters":{"type":"object","properties":{"url":{"type":"string"}},"required":["url"]}},
+{"name":"open_url","description":"Open a website in the browser. Use this for ANY website request like 'open the website google.com', even if the transcript spells the domain oddly (e.g. 'Google Punkt com' or 'Google Com').","parameters":{"type":"object","properties":{"url":{"type":"string"}},"required":["url"]}},
 {"name":"lock_screen","description":"Lock the screen","parameters":{"type":"object","properties":{}}},
 {"name":"sleep_mac","description":"Put the Mac to sleep","parameters":{"type":"object","properties":{}}},
 {"name":"take_screenshot","description":"Save a screenshot to the Desktop","parameters":{"type":"object","properties":{}}},
-{"name":"say_text","description":"Speak text aloud with the Mac voice. Use when asked to say, speak or announce something (e.g. 'say hello' or 'sag hallo')","parameters":{"type":"object","properties":{"text":{"type":"string"}},"required":["text"]}}]
+{"name":"say_text","description":"Speak text aloud with the Mac voice. Use when asked to say, speak or announce something (e.g. 'say hello' or 'sag hallo')","parameters":{"type":"object","properties":{"text":{"type":"string"}},"required":["text"]}},
+{"name":"open_settings_pane","description":"Open a System Settings pane. Use when the user asks where to find or how to change a setting, e.g. 'where can I see the battery status?' or 'wo sehe ich den Akkustand' -> pane 'battery'. Panes: battery, wifi, display, sound, appearance, notifications, storage, keyboard, mouse, bluetooth, network, privacy, softwareupdate, desktop, language, date, users, passwords, general.","parameters":{"type":"object","properties":{"pane":{"type":"string"}},"required":["pane"]}},
+{"name":"get_todays_events","description":"Show today's calendar events. Use when the user asks what appointments they have today (e.g. 'welchen Termin habe ich heute?'). Opens the Calendar app and speaks the answer. No arguments.","parameters":{"type":"object","properties":{}}},
+{"name":"find_on_page","description":"Scroll to and highlight text on the website currently shown in the frontmost browser window. Use when the user asks where to find something on the open webpage, e.g. 'wo finde ich die Adresse?'. The browser window must be in front.","parameters":{"type":"object","properties":{"text":{"type":"string"}},"required":["text"]}},
+{"name":"add_reminder","description":"Add an item to a reminders list, e.g. a shopping list ('ich muss noch Milch kaufen' -> list 'Einkauf', text 'Milch'). Creates the list if it does not exist. Default list name is 'Einkauf'.","parameters":{"type":"object","properties":{"list":{"type":"string"},"text":{"type":"string"}},"required":["text"]}},
+{"name":"remember","description":"Store a fact, preference or todo in long-term memory for later recall, e.g. 'merke dir mein Zug fährt um 7:15'.","parameters":{"type":"object","properties":{"text":{"type":"string"}},"required":["text"]}}]
 """
 
 /// speech language for recognition; nil = auto-detect (default)
@@ -48,6 +53,37 @@ final class Engine {
             cactus_init(nil, toolsJSON, nil)
             forcedLanguage?.withCString { cactus_set_audio($0, nil, 0) } ?? cactus_set_audio(nil, nil, 0)
             loaded = true
+        }
+    }
+
+    /// streaming live transcription: feed a chunk, get newly committed text + pending words
+    func streamProcess(_ pcm: [Float], done: @escaping (String, String) -> Void) {
+        queue.async {
+            var out = [CChar](repeating: 0, count: 1 << 16)
+            let n = pcm.withUnsafeBufferPointer { b in
+                cactus_stream_transcribe_process(b.baseAddress, Int32(pcm.count), forcedLanguage, nil, &out, Int32(out.count))
+            }
+            var text = "", pending = ""
+            if n > 0,
+               let json = try? JSONSerialization.jsonObject(with: Data(String(cString: out).utf8)) as? [String: Any] {
+                text = json["text"] as? String ?? ""
+                pending = json["pending"] as? String ?? ""
+            }
+            DispatchQueue.main.async { done(text, pending) }
+        }
+    }
+
+    /// finalize the stream: flush pending words, reset stream state for the next recording
+    func streamStop(done: @escaping (String) -> Void) {
+        queue.async {
+            var out = [CChar](repeating: 0, count: 1 << 16)
+            let n = cactus_stream_transcribe_stop(&out, Int32(out.count))
+            var text = ""
+            if n > 0,
+               let json = try? JSONSerialization.jsonObject(with: Data(String(cString: out).utf8)) as? [String: Any] {
+                text = json["text"] as? String ?? ""
+            }
+            DispatchQueue.main.async { done(text) }
         }
     }
 
@@ -102,13 +138,22 @@ final class Engine {
 final class Recorder {
     private let engine = AVAudioEngine()
     private var converter: AVAudioConverter?
-    private(set) var samples: [Float] = []
+    private var samples: [Float] = []
+    private let lock = NSLock() // samples: audio thread appends, main thread reads
     private var lastRMS: Float = 0
     private(set) var inputRate: Double = 0
     private var tapCount = 0
     var onLevel: ((Float) -> Void)? // ~20x/s, called on the audio thread
 
     var rms: Float { lastRMS }
+
+    var sampleCount: Int { lock.lock(); defer { lock.unlock() }; return samples.count }
+
+    func samples(from index: Int) -> [Float] {
+        lock.lock(); defer { lock.unlock() }
+        guard index < samples.count else { return [] }
+        return Array(samples[index...])
+    }
 
     /// warm up CoreAudio once at launch so real recordings start in ~100 ms instead of ~3 s
     func prepare() {
@@ -122,7 +167,7 @@ final class Recorder {
     }
 
     func start() throws {
-        samples = []
+        lock.lock(); samples = []; lock.unlock()
         lastRMS = 0
         tapCount = 0
         try setupAndStart()
@@ -164,8 +209,10 @@ final class Recorder {
         let n = Int(out.frameLength)
         guard n > 0 else { return }
         tapCount += 1
-        if tapCount % 25 == 1 { log("tap #\(tapCount): +\(n) samples, total \(samples.count), rms \(lastRMS)") }
+        if tapCount % 25 == 1 { log("tap #\(tapCount): +\(n) samples, total \(sampleCount), rms \(lastRMS)") }
+        lock.lock()
         samples.append(contentsOf: UnsafeBufferPointer(start: ch, count: n))
+        lock.unlock()
         var sum: Float = 0
         for i in 0..<n { sum += ch[i] * ch[i] }
         lastRMS = sqrt(sum / Float(n))
@@ -173,10 +220,10 @@ final class Recorder {
     }
 
     func stop() -> [Float] {
-        guard engine.isRunning else { return samples }
+        guard engine.isRunning else { return samples(from: 0) }
         engine.inputNode.removeTap(onBus: 0)
         engine.stop()
-        return samples
+        return samples(from: 0)
     }
 }
 
@@ -239,6 +286,46 @@ final class MicPanel: NSPanel {
 
 // MARK: - Mac actions (tool execution)
 
+private var lastASError: String?
+
+/// run an AppleScript source and return its output (empty on error)
+func runAS(_ source: String) -> String {
+    lastASError = nil
+    let script = NSAppleScript(source: source)
+    var err: NSDictionary?
+    let out = script?.executeAndReturnError(&err).stringValue ?? ""
+    if let err {
+        lastASError = (err[NSAppleScript.errorMessage] as? String) ?? "AppleScript error"
+        log("AS error: \(lastASError!)")
+    }
+    return out
+}
+
+/// app support dir for soul.md / memory.md
+var appSupport: String {
+    let dir = NSHomeDirectory() + "/Library/Application Support/MacVoice"
+    try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+    return dir
+}
+
+func ensureSoulAndMemory() {
+    let soul = appSupport + "/soul.md"
+    if !FileManager.default.fileExists(atPath: soul) {
+        let text = """
+        # MacVoice Soul
+        
+        Ich bin MacVoice, der Sprachassistent von Julian Petermaier.
+        Ich antworte kurz und ehrlich, auf Deutsch.
+        Ich steuere den Mac lokal — keine Cloud, keine Telemetrie.
+        """
+        try? text.write(toFile: soul, atomically: true, encoding: .utf8)
+    }
+    let mem = appSupport + "/memory.md"
+    if !FileManager.default.fileExists(atPath: mem) {
+        try? "# Memory\n".write(toFile: mem, atomically: true, encoding: .utf8)
+    }
+}
+
 func runCmd(_ args: [String]) -> String {
     let p = Process()
     p.executableURL = URL(fileURLWithPath: args[0])
@@ -263,6 +350,30 @@ let appNameAliases: [String: String] = [
     "maps": "Maps", "photos": "Photos", "music": "Music", "calculator": "Calculator",
 ]
 
+/// clean up spoken-domain artifacts: "Google Punkt kommen" -> "google.com"
+func normalizeURL(_ raw: String) -> String {
+    var s = raw.lowercased().trimmingCharacters(in: .whitespaces)
+    s = s.replacingOccurrences(of: "punkt", with: ".")  // German ASR spells the dot
+    s = s.replacingOccurrences(of: " dot ", with: ".")
+    s = s.replacingOccurrences(of: "kommen", with: "com") // misheard ".com"
+    for tld in ["com", "de", "net", "org", "at", "io", "dev", "co", "eu", "info"] {
+        s = s.replacingOccurrences(of: " \(tld)", with: ".\(tld)") // "google com" -> "google.com"
+    }
+    s = s.replacingOccurrences(of: " ", with: "")
+    while s.contains("..") { s = s.replacingOccurrences(of: "..", with: ".") }
+    s = s.trimmingCharacters(in: CharacterSet(charactersIn: "."))
+    if !s.hasPrefix("http://") && !s.hasPrefix("https://") { s = "https://" + s }
+    return s
+}
+
+/// does this string look like a spoken domain rather than an app name?
+func looksLikeDomain(_ s: String) -> Bool {
+    let l = s.lowercased()
+    return l.contains("punkt") || l.contains("kommen") || l.contains(" dot ")
+        || l.contains("www") || l.contains("http")
+        || l.range(of: "\\b(com|de|net|org|at|io|dev|eu)\\b", options: .regularExpression) != nil
+}
+
 func executeTool(_ name: String, _ args: [String: Any]) -> String {
     switch name {
     case "set_volume":
@@ -272,6 +383,11 @@ func executeTool(_ name: String, _ args: [String: Any]) -> String {
         let app = (args["app"] as? String) ?? ""
         let resolved = appNameAliases[app.lowercased().trimmingCharacters(in: .whitespaces)] ?? app
         let r = runCmd(["/usr/bin/open", "-a", resolved])
+        if r.contains("Unable to find application"), looksLikeDomain(app) {
+            // the model picked open_app for a spoken domain — open it as a website instead
+            log("open_app miss → URL: \"\(app)\" -> \(normalizeURL(app))")
+            return executeTool("open_url", ["url": app])
+        }
         // background launches don't get focus — activate explicitly
         _ = runCmd(["/usr/bin/osascript", "-e", "tell application \"\(resolved)\" to activate"])
         if resolved != app { log("app alias: \"\(app)\" -> \(resolved)") }
@@ -279,9 +395,7 @@ func executeTool(_ name: String, _ args: [String: Any]) -> String {
     case "quit_app":
         return runCmd(["/usr/bin/osascript", "-e", "tell application \"\((args["app"] as? String) ?? "")\" to quit"])
     case "open_url":
-        var url = (args["url"] as? String) ?? ""
-        if !url.hasPrefix("http://") && !url.hasPrefix("https://") { url = "https://" + url }
-        return runCmd(["/usr/bin/open", url])
+        return runCmd(["/usr/bin/open", normalizeURL((args["url"] as? String) ?? "")])
     case "lock_screen":
         let r = runCmd(["/usr/bin/osascript", "-e", "tell application \"System Events\" to keystroke \"q\" using {command down, control down}"])
         if r.contains("1002") || r.lowercased().contains("not authorized") || r.lowercased().contains("nicht berechtigt") {
@@ -295,6 +409,95 @@ func executeTool(_ name: String, _ args: [String: Any]) -> String {
         return runCmd(["/usr/sbin/screencapture", "-x", path])
     case "say_text":
         return runCmd(["/usr/bin/say", (args["text"] as? String) ?? ""])
+    case "open_settings_pane":
+        let panes: [String: String] = [
+            "battery": "com.apple.Battery-Settings", "batterie": "com.apple.Battery-Settings", "akkustand": "com.apple.Battery-Settings",
+            "wifi": "com.apple.Wi-Fi-Settings", "wlan": "com.apple.Wi-Fi-Settings",
+            "display": "com.apple.Display-Settings", "anzeige": "com.apple.Display-Settings",
+            "sound": "com.apple.Sound-Settings", "ton": "com.apple.Sound-Settings",
+            "appearance": "com.apple.Appearance-Settings", "design": "com.apple.Appearance-Settings",
+            "notifications": "com.apple.Notifications-Settings", "benachrichtigungen": "com.apple.Notifications-Settings",
+            "storage": "com.apple.Storage-Settings", "speicher": "com.apple.Storage-Settings",
+            "keyboard": "com.apple.Keyboard-Settings", "tastatur": "com.apple.Keyboard-Settings",
+            "mouse": "com.apple.Mouse-Settings", "maus": "com.apple.Mouse-Settings",
+            "bluetooth": "com.apple.Bluetooth-Settings",
+            "network": "com.apple.Network-Settings", "netzwerk": "com.apple.Network-Settings",
+            "privacy": "com.apple.Privacy-Settings", "datenschutz": "com.apple.Privacy-Settings",
+            "softwareupdate": "com.apple.Software-Update-Settings", "update": "com.apple.Software-Update-Settings",
+            "desktop": "com.apple.Desktop-Settings", "schreibtisch": "com.apple.Desktop-Settings",
+            "language": "com.apple.Language-Region-Settings", "sprache": "com.apple.Language-Region-Settings",
+            "date": "com.apple.Date-Time-Settings", "datum": "com.apple.Date-Time-Settings", "uhrzeit": "com.apple.Date-Time-Settings",
+            "users": "com.apple.Users-Groups-Settings", "benutzer": "com.apple.Users-Groups-Settings",
+            "passwords": "com.apple.Passwords-Settings", "passwörter": "com.apple.Passwords-Settings",
+            "general": "com.apple.General-Settings", "allgemein": "com.apple.General-Settings",
+        ]
+        let key = (args["pane"] as? String ?? "").lowercased()
+        let id = panes[key] ?? panes.first { key.contains($0.key) || $0.key.contains(key) && !key.isEmpty }?.value ?? "com.apple.General-Settings"
+        return runCmd(["/usr/bin/open", "x-apple.systempreferences:\(id)"])
+    case "get_todays_events":
+        let raw = runAS("""
+        tell application "Calendar"
+            set startOfDay to (current date) - (time of (current date))
+            set endOfDay to startOfDay + 86400
+            set out to ""
+            repeat with c in calendars
+                set evs to (every event of c whose start date >= startOfDay and start date < endOfDay)
+                repeat with e in evs
+                    set d to start date of e
+                    set out to out & ((hours of d) as text) & ":" & ((minutes of d) as text) & " " & (summary of e) & "|"
+                end repeat
+            end repeat
+            return out
+        end tell
+        """)
+        let events = raw.split(separator: "|").map(String.init).filter { !$0.isEmpty }.sorted()
+        let answer = events.isEmpty
+            ? "Du hast heute keine Termine."
+            : "Du hast heute \(events.count) Termin\(events.count == 1 ? ": " : "e: ")" + events.joined(separator: ", ") + "."
+        _ = runCmd(["/usr/bin/open", "-a", "Calendar"])
+        _ = runCmd(["/usr/bin/osascript", "-e", "tell application \"Calendar\" to activate"])
+        _ = runCmd(["/usr/bin/say", answer])
+        return answer
+    case "find_on_page":
+        let text = (args["text"] as? String) ?? ""
+        let browsers: [String: String] = ["com.apple.Safari": "Safari", "com.brave.Browser": "Brave",
+                                         "com.google.Chrome": "Google Chrome", "company.thebrowser.Browser": "Arc",
+                                         "com.microsoft.edgemac": "Microsoft Edge"]
+        guard let front = NSWorkspace.shared.frontmostApplication,
+              let browser = browsers[front.bundleIdentifier ?? ""] else {
+            return "no browser window in front — open the page first, then ask again"
+        }
+        let js = "window.find(\"\(text)\")"
+        let script = "tell application \"\(browser)\" to execute (active tab of front window) javascript \"\(js)\""
+        let r = runAS(script)
+        if let e = lastASError {
+            if e.lowercased().contains("deaktiviert") || e.lowercased().contains("disabled") {
+                return "enable 'View > Developer > Allow JavaScript from Apple Events' in \(browser)"
+            }
+            return e
+        }
+        return "highlighted: \(text)"
+    case "add_reminder":
+        var list = (args["list"] as? String) ?? "Einkauf"
+        let aliases: [String: String] = ["einkaufsliste": "Einkauf", "einkauf": "Einkauf", "shopping list": "Einkauf", "shopping": "Einkauf"]
+        if let a = aliases[list.lowercased()] { list = a }
+        let text = (args["text"] as? String) ?? ""
+        _ = runAS("""
+        tell application "Reminders"
+            if not (exists list "\(list)") then make new list with name "\(list)"
+            make new reminder at list "\(list)" with name "\(text)"
+        end tell
+        """)
+        let answer = "\(text) steht auf der Liste \(list)."
+        _ = runCmd(["/usr/bin/say", answer])
+        return answer
+    case "remember":
+        let text = (args["text"] as? String) ?? ""
+        let line = "- \(Date()): \(text)\n"
+        if let h = FileHandle(forWritingAtPath: appSupport + "/memory.md") {
+            h.seekToEndOfFile(); h.write(line.data(using: .utf8)!); h.closeFile()
+        }
+        return "remembered: \(text)"
     default:
         return "unknown tool: \(name)"
     }
@@ -331,7 +534,7 @@ func paste(_ text: String) {
 
 enum Mode { case dictation, toolCall }
 
-let appVersion = "1.2.1"
+let appVersion = "1.3.0"
 let gitHubRepo = "JPE-Studio/MacVoice" // GitHub repo for the update check
 
 enum DictKey: String { case rightCmd, rightOpt, f5 }
@@ -376,6 +579,9 @@ final class Controller: NSObject, NSApplicationDelegate {
     private var rightOptDown = false
     private var cmdShiftDown = false
     private var recordingSource: Mode?
+    private var fedSamples = 0            // streaming: samples already fed to the engine
+    private var collectedPcm: [Float] = [] // full audio for the tool-call path
+    private var confirmedText = ""        // live transcription: committed words
     private var dictKey: DictKey = .rightCmd
     private var toolKey: ToolKey = .cmdShift
     private var dictSub = NSMenu()
@@ -388,6 +594,8 @@ final class Controller: NSObject, NSApplicationDelegate {
 
     func applicationDidFinishLaunching(_ note: Notification) {
         log("launch; AX trusted: \(AXIsProcessTrusted())")
+        ensureSoulAndMemory()
+        log("soul: \(appSupport)/soul.md")
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         dictKey = DictKey(rawValue: UserDefaults.standard.string(forKey: "dictKey") ?? "") ?? .rightCmd
         toolKey = ToolKey(rawValue: UserDefaults.standard.string(forKey: "toolKey") ?? "") ?? .cmdShift
@@ -425,7 +633,7 @@ final class Controller: NSObject, NSApplicationDelegate {
         let updateItem = NSMenuItem(title: "Check for updates", action: #selector(checkForUpdatesMenu), keyEquivalent: "")
         updateItem.target = self
         menu.addItem(updateItem)
-        let testItem = NSMenuItem(title: "Test tool call (open Figma)", action: #selector(testToolCall), keyEquivalent: "")
+        let testItem = NSMenuItem(title: "Test tool call (calendar)", action: #selector(testToolCall), keyEquivalent: "")
         testItem.target = self
         menu.addItem(testItem)
         let aboutItem = NSMenuItem(title: "About MacVoice", action: #selector(showAbout), keyEquivalent: "")
@@ -479,6 +687,9 @@ final class Controller: NSObject, NSApplicationDelegate {
         guard ready, !recording else { return }
         self.mode = mode
         self.recordingSource = mode
+        fedSamples = 0
+        collectedPcm = []
+        confirmedText = ""
         do {
             try recorder.start()
             log("recorder started, input rate: \(recorder.inputRate)")
@@ -503,27 +714,32 @@ final class Controller: NSObject, NSApplicationDelegate {
         guard recording else { log("stop ignored (not recording)"); return }
         waveTimer?.invalidate(); waveTimer = nil
         panel?.orderOut(nil)
-        let pcm = recorder.stop()
+        let remaining = recorder.stop()
+        collectedPcm.append(contentsOf: remaining)
         recording = false
         recordingSource = nil
-        log("stopped, samples: \(pcm.count)")
+        log("stopped, samples: \(collectedPcm.count)")
         setIcon("…")
         statusLine.title = "transcribing …"
-        guard pcm.count > 1600 else { finish("(too short)"); return }
+        guard collectedPcm.count > 1600 else { finish("(too short)"); return }
         switch mode {
         case .dictation:
-            Engine.shared.transcribe(pcm) { [weak self] result in
+            // the streaming result IS the transcript — no second pass needed
+            Engine.shared.streamStop { [weak self] pending in
                 guard let self else { return }
-                let text = (result?["text"] as? String) ?? ""
-                log("transcribed: \"\(text)\" raw=\(result ?? [:])")
+                var text = self.confirmedText
+                if !pending.isEmpty { text += (text.isEmpty ? "" : " ") + pending }
+                log("transcribed (stream): \"\(text)\"")
                 if text.isEmpty { self.finish("(silence)"); return }
                 // always paste: works in every app (incl. Electron), no AX guesswork
                 paste(text)
                 self.finish("✓ \"\(text)\"")
             }
         case .toolCall:
+            // reset the stream state, then run the audio tool call on the full clip
+            Engine.shared.streamStop { _ in }
             // input must be nil for the audio path — "" makes cactus_complete fail
-            Engine.shared.complete(input: nil, pcm: pcm) { [weak self] r in
+            Engine.shared.complete(input: nil, pcm: collectedPcm) { [weak self] r in
                 self?.handleCalls(r)
             }
         }
@@ -593,6 +809,7 @@ final class Controller: NSObject, NSApplicationDelegate {
         recording = false
         recordingSource = nil
         setIcon("🎙")
+        Engine.shared.streamStop { _ in } // reset stream state
         log("cancelled (key joined)")
     }
 
@@ -603,6 +820,26 @@ final class Controller: NSObject, NSApplicationDelegate {
         waveHistory = Array(recent)
         panel?.waveView.history = waveHistory
         panel?.waveView.needsDisplay = true
+
+        // live transcription: feed new audio to the streaming engine every ~0.5 s
+        let count = recorder.sampleCount
+        if count - fedSamples >= 8000 {
+            let chunk = recorder.samples(from: fedSamples)
+            fedSamples = count
+            collectedPcm.append(contentsOf: chunk)
+            Engine.shared.streamProcess(chunk) { [weak self] text, pending in
+                guard let self else { return }
+                if !text.isEmpty {
+                    self.confirmedText += (self.confirmedText.isEmpty ? "" : " ") + text
+                }
+                var live = self.confirmedText
+                if !pending.isEmpty { live += (live.isEmpty ? "" : " ") + pending }
+                if !live.isEmpty {
+                    self.panel?.waveView.label = String(live.suffix(30))
+                    self.panel?.waveView.needsDisplay = true
+                }
+            }
+        }
     }
 
     // MARK: settings + updates
@@ -644,7 +881,8 @@ final class Controller: NSObject, NSApplicationDelegate {
     @objc private func testToolCall() {
         statusLine.title = "running test: open_app …"
         DispatchQueue.global(qos: .userInitiated).async {
-            let out = executeTool("open_app", ["app": "Figma"])
+            // end-to-end test of use case 2: calendar + spoken answer
+            let out = executeTool("get_todays_events", [:])
             DispatchQueue.main.async {
                 log("TEST open_app -> \(out)")
                 self.finish("test: \(out)")

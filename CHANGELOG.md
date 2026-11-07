@@ -1,5 +1,14 @@
 # Changelog
 
+## v1.3.0
+- Use case 1 — settings navigation: `open_settings_pane` opens the right System Settings pane ("wo sehe ich den Batteriestatus?" → Battery), 20+ panes with German aliases
+- Use case 2 — calendar: `get_todays_events` reads today's events, opens Calendar and speaks the answer
+- Use case 3 — page search: `find_on_page` scrolls to and highlights text in the frontmost browser (Safari/Brave/Chrome/Arc/Edge; needs "Allow JavaScript from Apple Events" once)
+- Use case 4 — shopping list: `add_reminder` adds items to a Reminders list (creates "Einkauf" if missing), speaks the confirmation
+- Memory: `remember` tool appends to `~/Library/Application Support/MacVoice/memory.md`
+- `soul.md` — personality file, created on first launch
+- All four use cases run on-device with the existing models — no new model, still ~250 MB RAM (fits 8 GB Macs)
+
 ## v1.2.1
 - Fixed tool calling: an empty input string broke the audio tool-call path (`cactus_complete` requires `NULL`)
 - `open_app` now activates the target app — background launches no longer open without focus
